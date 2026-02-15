@@ -210,9 +210,13 @@ let path_export = URL(fileURLWithPath: arguments[2])
 let url_export_heic = path_export.appendingPathComponent(filename!)
 let url_export_jpg = path_export.appendingPathComponent(filename_jpg!)
 
-if [pq_export, hlg_export, sdr_export, gain_map_type1, gain_map_type2, base_image_bool].filter({$0}).count >= 2 {
+if [pq_export, hlg_export, sdr_export, gain_map_type1, gain_map_type2].filter({$0}).count >= 2 {
     print("Error: Only one export format can be used.")
     exit(1)
+}
+if base_image_bool && sdr_export {
+     print("Error: Base image cannot be used with SDR export.")
+     exit(1)
 }
 if (jpg_export && hlg_export) || (jpg_export && pq_export) {
     print("Error: Not support exporting JPEG with HLG or PQ transfer function.")
@@ -239,7 +243,7 @@ if tonemappingratio_bool && base_image_bool {print("Warrning: Base image specifi
 if tonemappingratio_bool && hlg_export {print("Warrning: Tone mapping ratio will not be applied when exporting HLG HDR image.")}
 if tonemappingratio_bool && pq_export {print("Warrning: Tone mapping ratio will not be applied when exporting PQ HDR image.")}
 if half_size && !gain_map_type1 && !gain_map_type2 {print("Warrning: Only Apple gain map format support half size gain map.")}
-if base_image_bool && monochrome_export {print("Warrning: Base image specified, will use RGB gain map.")}
+// if base_image_bool && monochrome_export {print("Warrning: Base image specified, will use RGB gain map.")}
 
 
 // export hlg and pq hdr file
@@ -341,17 +345,19 @@ headroom_ratio = pic_headroom2
 
 
 func generate_sdr_image() -> CIImage?{
-    if gain_map_type1 {
-        return hdr_image.applyingFilter("CIToneMapHeadroom", parameters: ["inputSourceHeadroom":headroom_ratio,"inputTargetHeadroom":1.0])
-    }
     if base_image_bool {
         if CIImage(contentsOf: base_image_url!) == nil {
             print("Warning: Could not load base image, will generate base image by tone mapping.")
             base_image_bool = false
             return hdr_image.applyingFilter("CIToneMapHeadroom", parameters: ["inputSourceHeadroom":headroom_ratio,"inputTargetHeadroom":1.0])
         } else {
-            return CIImage(contentsOf: base_image_url!)
+            // Apply a no-op filter to strip source metadata (like Exif) from the base image
+            // This ensures it behaves like a generated image, preventing potential metadata conflicts
+            return CIImage(contentsOf: base_image_url!)?.applyingFilter("CIGammaAdjust", parameters: ["inputPower": 1.0])
         }
+    }
+    if gain_map_type1 {
+        return hdr_image.applyingFilter("CIToneMapHeadroom", parameters: ["inputSourceHeadroom":headroom_ratio,"inputTargetHeadroom":1.0])
     }
     return hdr_image.applyingFilter("CIToneMapHeadroom", parameters: ["inputSourceHeadroom":headroom_ratio,"inputTargetHeadroom":1.0])
 }
@@ -383,8 +389,8 @@ while sdr_export{
 }
 
 // -b: export RGB gain map image with specified base image
-if base_image_bool {
-    let rgb_export_options = NSDictionary(dictionary:[kCGImageDestinationLossyCompressionQuality:imagequality ?? 0.85, CIImageRepresentationOption.hdrImage:hdr_image,CIImageRepresentationOption.hdrGainMapAsRGB:true])
+if base_image_bool && !gain_map_type1 && !gain_map_type2 {
+    let rgb_export_options = NSDictionary(dictionary:[kCGImageDestinationLossyCompressionQuality:imagequality ?? 0.85, CIImageRepresentationOption.hdrImage:hdr_image,CIImageRepresentationOption.hdrGainMapAsRGB:!monochrome_export])
     
     if jpg_export {
         try! ctx.writeJPEGRepresentation(of: tonemapped_sdrimage!,

@@ -10,7 +10,7 @@
 
 using namespace metal;
 
-extern "C" float4 GainMapFilter(coreimage::sample_t hdr, coreimage::sample_t sdr,float hdrmax, coreimage::destination dest)
+extern "C" [[ stitchable ]] float4 GainMapFilter(coreimage::sample_t hdr, coreimage::sample_t sdr,float hdrmax)
 {
     float gamma_ratio;
     float ratio;

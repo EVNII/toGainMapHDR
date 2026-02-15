@@ -19,12 +19,14 @@ class GainMapFilter: CIFilter {
               fatalError("Unable to load metallib")
             }
         
-        guard let kernel = try? CIColorKernel(
+        do {
+            return try CIColorKernel(
               functionName: "GainMapFilter",
-              fromMetalLibraryData: data) else {
-              fatalError("Unable to create color kernel")
-            }
-        return kernel
+              fromMetalLibraryData: data)
+        } catch {
+            print("Error creating kernel: \(error)")
+            fatalError("Unable to create color kernel")
+        }
     }()
     override var outputImage: CIImage? {
         guard let HDRImage = HDRImage else { return nil }
