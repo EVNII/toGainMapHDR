@@ -441,7 +441,17 @@ if base_image_bool && !gain_map_type1 && !gain_map_type2 {
                                              options: rgb_export_options as! [CIImageRepresentationOption : Any])
         }
     }
-    if iso_xmp_export && jpg_export { convertToISOGainMapXMP(at: url_export_jpg) }
+    if iso_xmp_export && jpg_export {
+        // Use libultrahdr to generate ISO gain map JPEG
+        // We need to pass the HDR image (Linear/PQ/HA) and the Tone Mapped SDR image
+        // The generateISOGainMap function handles export and invocation
+        print("Generating ISO 21496-1 Gain Map via libultrahdr...")
+        generateISOGainMap(hdr: hdr_image,
+                          sdr: tonemapped_sdrimage!,
+                          outputURL: url_export_jpg,
+                          quality: imagequality ?? 0.85,
+                          colorSpace: CGColorSpace(name: sdr_color_space)!)
+    }
     exit(0)
 }
 
@@ -453,6 +463,18 @@ if !gain_map_type1 && !gain_map_type2 {
     } else {
         adaptive_export_options = NSDictionary(dictionary:[kCGImageDestinationLossyCompressionQuality:imagequality ?? 0.85, CIImageRepresentationOption.hdrImage:hdr_image,CIImageRepresentationOption.hdrGainMapAsRGB:true])
     }
+    if iso_xmp_export && jpg_export {
+        // If ISO export requested for JPEG, ONLY use libultrahdr path
+        // Do NOT write the CoreImage JPEG first, as libultrahdr will overwrite it
+        print("Generating ISO 21496-1 Gain Map via libultrahdr...")
+        generateISOGainMap(hdr: hdr_image,
+                          sdr: tonemapped_sdrimage!,
+                          outputURL: url_export_jpg,
+                          quality: imagequality ?? 0.85,
+                          colorSpace: CGColorSpace(name: sdr_color_space)!)
+        exit(0)
+    }
+    
     if jpg_export {
         try! ctx.writeJPEGRepresentation(of: tonemapped_sdrimage!,
                                          to: url_export_jpg,
@@ -472,7 +494,6 @@ if !gain_map_type1 && !gain_map_type2 {
                                              options: adaptive_export_options as! [CIImageRepresentationOption : Any])
         }
     }
-    if iso_xmp_export && jpg_export { convertToISOGainMapXMP(at: url_export_jpg) }
     exit(0)
 }
 
@@ -527,7 +548,17 @@ if gain_map_type1 {
                                              options: alt_export_options as! [CIImageRepresentationOption : Any])
         }
     }
-    if iso_xmp_export && jpg_export { convertToISOGainMapXMP(at: url_export_jpg) }
+    if iso_xmp_export && jpg_export {
+        // For -g we stick to Apple gain map unless -i overrides, but current logic mimics main path
+        // However, -g generates valid Apple gain map manually, libultrahdr might generate different map
+        // Given we want ISO compliance, if -i is set, we prefer libultrahdr's generation
+        print("Generating ISO 21496-1 Gain Map via libultrahdr...")
+        generateISOGainMap(hdr: hdr_image,
+                          sdr: tonemapped_sdrimage!,
+                          outputURL: url_export_jpg,
+                          quality: imagequality ?? 0.85,
+                          colorSpace: CGColorSpace(name: sdr_color_space)!)
+    }
     exit(0)
 }
 
@@ -581,211 +612,125 @@ if jpg_export {
 //try! ctx.writePNGRepresentation(of: sdr_image!, to: url_export_heic2, format: CIFormat.RGBA8, colorSpace:CGColorSpace(name: CGColorSpace.displayP3)!)
 exit(0)
 
-// MARK: - ISO 21496-1 XMP Conversion
-// Converts Apple's HDRToneMap XMP format to ISO 21496-1 hdrgm format in JPEG files.
-// The Adobe Gain Map Demo App requires this format to display gain map layers from JPEG.
-
-func convertToISOGainMapXMP(at url: URL) {
-    guard let fileData = try? Data(contentsOf: url) else { return }
-    let result = processJPEGForISO(fileData)
-    try? result.write(to: url, options: .atomic)
-    print("Converted JPEG gain map XMP to ISO 21496-1 format.")
-}
+// MARK: - ISO 21496-1 Generation via libultrahdr
+// Uses the bundled ultrahdr_app binary to generate ISO 21496-1 compliant JPEGs
 
 
-func processJPEGForISO(_ data: Data, isSecondary: Bool = false) -> Data {
-    var result = Data()
-    var i = 0
-    var firstXMP = true
-    guard data.count >= 2, data[0] == 0xFF, data[1] == 0xD8 else { return data }
-    result.append(contentsOf: data[0..<2])
-    i = 2
 
-    while i < data.count - 1 {
-        guard data[i] == 0xFF else { result.append(data[i]); i += 1; continue }
-        let marker = data[i + 1]
-
-        // RST markers (no length)
-        if marker >= 0xD0 && marker <= 0xD7 || marker == 0x01 {
-            result.append(contentsOf: data[i..<(i+2)]); i += 2; continue
-        }
-
-        // EOI - check for secondary image (MPF gain map)
-        if marker == 0xD9 {
-            result.append(contentsOf: [0xFF, 0xD9]); i += 2
-            if i < data.count - 1, data[i] == 0xFF, data[i+1] == 0xD8 {
-                result.append(processJPEGForISO(Data(data[i...]), isSecondary: true))
-            }
-            return result
-        }
-
-        // SOS - copy header + entropy-coded data
-        if marker == 0xDA {
-            guard i + 3 < data.count else { result.append(contentsOf: data[i...]); return result }
-            let sLen = (Int(data[i+2]) << 8) | Int(data[i+3])
-            let sEnd = min(i + 2 + sLen, data.count)
-            result.append(contentsOf: data[i..<sEnd])
-            var j = sEnd
-            while j < data.count {
-                if data[j] == 0xFF, j + 1 < data.count {
-                    let nm = data[j + 1]
-                    if nm == 0x00 || (nm >= 0xD0 && nm <= 0xD7) {
-                        result.append(contentsOf: data[j..<(j+2)]); j += 2
-                    } else { break }
-                } else { result.append(data[j]); j += 1 }
-            }
-            i = j; continue
-        }
-
-        // Regular segment with length
-        guard i + 3 < data.count else { result.append(contentsOf: data[i...]); return result }
-        let segLen = (Int(data[i+2]) << 8) | Int(data[i+3])
-        let segEnd = min(i + 2 + segLen, data.count)
-
-        // APP1 - check for XMP
-        if marker == 0xE1 {
-            let contentStart = i + 4
-            let xmpId = Data("http://ns.adobe.com/xap/1.0/\0".utf8)
-            if segLen > xmpId.count + 2, contentStart + xmpId.count <= segEnd,
-               data[contentStart..<(contentStart + xmpId.count)] == xmpId {
-                let xmpStart = contentStart + xmpId.count
-                if var xmpStr = String(data: data[xmpStart..<segEnd], encoding: .utf8) {
-                    let origLen = data[xmpStart..<segEnd].count
-                    
-                    if firstXMP && !isSecondary {
-                        // Primary image XMP: inject hdrgm namespace for macOS HDR detection
-                        xmpStr = injectHdrgmNamespace(xmpStr)
-                        firstXMP = false
-                    } else {
-                        // Gain map image XMP: convert Apple format to ISO
-                        xmpStr = applyISOReplacements(xmpStr)
-                    }
-                    
-                    var newXmpData = Data(xmpStr.utf8)
-                    // Pad or trim to keep same size
-                    if newXmpData.count < origLen {
-                        newXmpData.append(Data(repeating: 0x20, count: origLen - newXmpData.count))
-                    } else if newXmpData.count > origLen {
-                        newXmpData = newXmpData.prefix(origLen)
-                    }
-                    // Write APP1 with same length
-                    result.append(contentsOf: [0xFF, marker])
-                    result.append(data[i+2]); result.append(data[i+3]) // same length
-                    result.append(xmpId)
-                    result.append(newXmpData)
-                    i = segEnd; continue
-                }
-            }
-        }
-
-        // APP2 - check for MPF, inject ISO URN after it
-        if marker == 0xE2 {
-            let contentStart = i + 4
-            let mpfId = Data("MPF\0".utf8)
-            result.append(contentsOf: data[i..<segEnd])
-            i = segEnd
-            // If this is the MPF segment, inject ISO URN APP2 right after
-            if contentStart + mpfId.count <= segEnd,
-               data[contentStart..<(contentStart + mpfId.count)] == mpfId {
-                var urnPayload = Data("urn:iso:std:iso:ts:21496:-1".utf8)
-                urnPayload.append(contentsOf: [0x00, 0x00, 0x00, 0x00, 0x00]) // null + padding (matches reference)
-                let urnLen = urnPayload.count + 2
-                result.append(contentsOf: [0xFF, 0xE2]) // APP2 marker
-                result.append(UInt8((urnLen >> 8) & 0xFF))
-                result.append(UInt8(urnLen & 0xFF))
-                result.append(urnPayload)
-            }
-            continue
-        }
-
-        // Copy segment as-is
-        result.append(contentsOf: data[i..<segEnd])
-        i = segEnd
-    }
-    if i < data.count { result.append(contentsOf: data[i...]) }
-    return result
-}
-
-func applyISOReplacements(_ xmp: String) -> String {
-    // Parse values from Apple's XMP format
-    func extractValue(_ tag: String, from s: String) -> String? {
-        let open = "<HDRToneMap:\(tag)>"
-        let close = "</HDRToneMap:\(tag)>"
-        guard let start = s.range(of: open), let end = s.range(of: close) else { return nil }
-        return String(s[start.upperBound..<end.lowerBound])
-    }
-    func extractChannelValues(_ tag: String, from s: String) -> [String] {
-        var values: [String] = []
-        var search = s.startIndex
-        let open = "<HDRToneMap:\(tag)>"
-        let close = "</HDRToneMap:\(tag)>"
-        while let start = s.range(of: open, range: search..<s.endIndex),
-              let end = s.range(of: close, range: start.upperBound..<s.endIndex) {
-            values.append(String(s[start.upperBound..<end.lowerBound]))
-            search = end.upperBound
-        }
-        return values
-    }
-
-    let capacityMax = extractValue("AlternateHeadroom", from: xmp) ?? "1.0"
-    let capacityMin = extractValue("BaseHeadroom", from: xmp) ?? "0.0"
-    let baseIsHDR = extractValue("BaseRenditionIsHDR", from: xmp) ?? "0"
-    let version = extractValue("Version", from: xmp) ?? "1"
-    let gainMapMin = extractChannelValues("GainMapMin", from: xmp)
-    let gainMapMax = extractChannelValues("GainMapMax", from: xmp)
-    let gamma = extractChannelValues("Gamma", from: xmp)
-    let offsetSDR = extractChannelValues("OffsetSDR", from: xmp)
-    let offsetHDR = extractChannelValues("OffsetHDR", from: xmp)
+func generateISOGainMap(hdr: CIImage, sdr: CIImage, outputURL: URL, quality: Double, colorSpace: CGColorSpace) {
+    let fileManager = FileManager.default
+    let tempDir = fileManager.temporaryDirectory
+    let uuid = UUID().uuidString
     
-    let baseIsHDRStr = (baseIsHDR == "0" || baseIsHDR == "false") ? "False" : "True"
-
-    func rdfSeq(_ values: [String]) -> String {
-        if values.isEmpty { return "<rdf:Seq/>" }
-        let items = values.map { "     <rdf:li>\($0)</rdf:li>" }.joined(separator: "\n")
-        return "<rdf:Seq>\n\(items)\n    </rdf:Seq>"
+    let hdrRawURL = tempDir.appendingPathComponent("\(uuid)_hdr.raw")
+    let sdrJpegURL = tempDir.appendingPathComponent("\(uuid)_sdr.jpg")
+    let outURL = tempDir.appendingPathComponent("\(uuid)_out.jpg")
+    
+    // 1. Export SDR as JPEG
+    
+    // We need to determine width/height
+    let width = Int(hdr.extent.width)
+    let height = Int(hdr.extent.height)
+    
+    do {
+         try ctx.writeJPEGRepresentation(of: sdr,
+                                         to: sdrJpegURL,
+                                         colorSpace: colorSpace,
+                                         options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: quality])
+    } catch {
+        print("Error exporting temp SDR JPEG: \(error)")
+        return
     }
-
-    // Build ISO 21496-1 compliant XMP (matching Lightroom's format)
-    return """
-<?xpacket begin="\u{feff}" id="W5M0MpCehiHzreSzNTczkc9d"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/">
- <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-  <rdf:Description rdf:about=""
-    xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"
-   hdrgm:Version="1.0"
-   hdrgm:BaseRenditionIsHDR="\(baseIsHDRStr)"
-   hdrgm:HDRCapacityMin="\(capacityMin)"
-   hdrgm:HDRCapacityMax="\(capacityMax)"
-   hdrgm:OffsetSDR="\(offsetSDR.first ?? "0.000010")"
-   hdrgm:OffsetHDR="\(offsetHDR.first ?? "0.000010")">
-   <hdrgm:GainMapMin>
-    \(rdfSeq(gainMapMin))
-   </hdrgm:GainMapMin>
-   <hdrgm:GainMapMax>
-    \(rdfSeq(gainMapMax))
-   </hdrgm:GainMapMax>
-   <hdrgm:Gamma>
-    \(rdfSeq(gamma))
-   </hdrgm:Gamma>
-  </rdf:Description>
- </rdf:RDF>
-</x:xmpmeta>
-<?xpacket end="w"?>
-"""
-}
-
-func injectHdrgmNamespace(_ xmp: String) -> String {
-    var s = xmp
-    // Add hdrgm namespace and Version to rdf:Description for macOS HDR detection
-    let nsDecl = "xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\" hdrgm:Version=\"1.0\""
-    if let range = s.range(of: "rdf:about=\"\"") {
-        s = s.replacingCharacters(in: range, with: "rdf:about=\"\" \(nsDecl)")
+    
+    // 2. Export HDR as Raw RGBA F16 (Linear P3)
+    // libultrahdr expects:
+    // -a 4: rgbahalffloat (linear)
+    // -a 5: rgba1010102 (pq or hlg) - we use this for HLG/PQ but linear F16 is safest for general CIImage
+    
+    // Let's use RGBA F16 Linear P3
+    let linearP3 = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)!
+    let hdrBytesPerRow = width * 8 // 4 channels * 2 bytes
+    var hdrData = Data(count: hdrBytesPerRow * height)
+    
+    // Render to bitmap
+    // Use a separate context with linear working space to ensure correct values
+    let linearCtx = CIContext(options: [.workingColorSpace: linearP3])
+    
+    hdrData.withUnsafeMutableBytes { ptr in
+        linearCtx.render(hdr,
+                         toBitmap: ptr.baseAddress!,
+                         rowBytes: hdrBytesPerRow,
+                         bounds: hdr.extent,
+                         format: .RGBAh,
+                         colorSpace: linearP3)
     }
-    return s
+    
+    do {
+        try hdrData.write(to: hdrRawURL)
+    } catch {
+        print("Error exporting temp HDR raw: \(error)")
+        return
+    }
+    
+    // 3. Invoke ultrahdr_app
+    // Find ultrahdr_app binary relative to our executable
+    let executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    let binDir = executableURL.deletingLastPathComponent()
+    let ultrahdrAppURL = binDir.appendingPathComponent("ultrahdr_app")
+    
+    guard fileManager.fileExists(atPath: ultrahdrAppURL.path) else {
+        print("Error: ultrahdr_app binary not found at \(ultrahdrAppURL.path)")
+        return
+    }
+    
+    // Determine Gamut Index based on Color Space Name
+    var sdrGamutIdx = 0 // Default to Rec.709
+    if let csName = colorSpace.name {
+        if csName == CGColorSpace.displayP3 || csName == CGColorSpace.dcip3 {
+            sdrGamutIdx = 1
+        } else if csName == CGColorSpace.itur_2020 || csName == CGColorSpace.itur_2100_PQ { 
+             sdrGamutIdx = 2
+        } else if String(csName as NSString).contains("2020") || String(csName as NSString).contains("2100") {
+             sdrGamutIdx = 2
+        }
+    }
+    
+    let qualityInt = Int(quality * 100)
+    
+    // Use bash wrapper to avoid Process quirks
+    let cmdString = "'\(ultrahdrAppURL.path)' -m 0 -p '\(hdrRawURL.path)' -i '\(sdrJpegURL.path)' -w \(width) -h \(height) -a 4 -t 0 -C 1 -c \(sdrGamutIdx) -q \(qualityInt) -z '\(outURL.path)'"
+    
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/bin/bash")
+    task.arguments = ["-c", cmdString]
+    
+    do {
+        try task.run()
+        task.waitUntilExit()
+        
+        if task.terminationStatus != 0 {
+             print("ultrahdr_app failed with status \(task.terminationStatus)")
+             return
+        }
+        
+        print("ultrahdr_app finished with status 0")
+        
+        // 4. Move output to destination
+        if fileManager.fileExists(atPath: outURL.path) {
+            _ = try? fileManager.removeItem(at: outputURL) // Remove existing
+            try fileManager.moveItem(at: outURL, to: outputURL)
+            print("Successfully generated ISO gain map JPEG via libultrahdr")
+        } else {
+             print("Error: ultrahdr_app did not produce output file at \(outURL.path)")
+        }
+        
+    } catch {
+        print("Error running ultrahdr_app: \(error)")
+    }
+    
+    // Cleanup
+    try? fileManager.removeItem(at: hdrRawURL)
+    try? fileManager.removeItem(at: sdrJpegURL)
+    try? fileManager.removeItem(at: outURL)
 }
-
-// debug
-//let filename2 = url_hdr.deletingPathExtension().appendingPathExtension("png").lastPathComponent
-//let url_export_heic2 = path_export.appendingPathComponent(filename2)
-//try! ctx.writePNGRepresentation(of: gainmap!, to: url_export_heic2, format: CIFormat.RGBA8, colorSpace:CGColorSpace(name: CGColorSpace.displayP3)!)
 exit(0)
