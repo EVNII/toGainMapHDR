@@ -245,6 +245,18 @@ if tonemappingratio_bool && pq_export {print("Warrning: Tone mapping ratio will 
 if half_size && !gain_map_type1 && !gain_map_type2 {print("Warrning: Only Apple gain map format support half size gain map.")}
 // if base_image_bool && monochrome_export {print("Warrning: Base image specified, will use RGB gain map.")}
 
+if base_image_bool {
+    if let base_img = CIImage(contentsOf: base_image_url!) {
+        let base_headroom = maxLuminance(from: base_img) ?? 0.0
+        if base_headroom > 1.05 {
+             print("Warning: Base image headroom: \(base_headroom). EDR base will be converted to SDR for gain map generation.")
+        }
+    }
+}
+if monochrome_export {
+    print("Warning: Monochrome Gain Map is not fully supported by all viewers. Forcing RGB Gain Map for compatibility.")
+}
+
 
 // export hlg and pq hdr file
 while hlg_export{
@@ -350,11 +362,26 @@ func generate_sdr_image() -> CIImage?{
             print("Warning: Could not load base image, will generate base image by tone mapping.")
             base_image_bool = false
             return hdr_image.applyingFilter("CIToneMapHeadroom", parameters: ["inputSourceHeadroom":headroom_ratio,"inputTargetHeadroom":1.0])
-        } else {
+        }
             // Apply a no-op filter to strip source metadata (like Exif) from the base image
             // This ensures it behaves like a generated image, preventing potential metadata conflicts
-            return CIImage(contentsOf: base_image_url!)?.applyingFilter("CIGammaAdjust", parameters: ["inputPower": 1.0])
-        }
+            let base = CIImage(contentsOf: base_image_url!)
+            if (maxLuminance(from: base!) ?? 1.0) > 1.05 {
+                 print("Warning: Base image is EDR (headroom > 1.05). Rendering to 8-bit SDR for gain map generation.")
+                 
+                 // CIImage filters are lazy — clamping alone doesn't strip EDR properties.
+                 // Force pixel materialization by rendering to a CGImage in the target SDR color space.
+                 let clamped = base!.applyingFilter("CIColorClamp", parameters: [
+                     "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                     "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+                 ])
+                 if let cgImage = ctx.createCGImage(clamped, from: clamped.extent, format: .RGBA8, colorSpace: CGColorSpace(name: sdr_color_space)!) {
+                     return CIImage(cgImage: cgImage)
+                 }
+                 // Fallback: return clamped with no-op filter
+                 return clamped.applyingFilter("CIGammaAdjust", parameters: ["inputPower": 1.0])
+            }
+            return base?.applyingFilter("CIGammaAdjust", parameters: ["inputPower": 1.0])
     }
     if gain_map_type1 {
         return hdr_image.applyingFilter("CIToneMapHeadroom", parameters: ["inputSourceHeadroom":headroom_ratio,"inputTargetHeadroom":1.0])
@@ -388,7 +415,7 @@ while sdr_export{
     exit(0)
 }
 
-// -b: export RGB gain map image with specified base image
+// -b: export RGB gain map image with specified base image (ISO format)
 if base_image_bool && !gain_map_type1 && !gain_map_type2 {
     let rgb_export_options = NSDictionary(dictionary:[kCGImageDestinationLossyCompressionQuality:imagequality ?? 0.85, CIImageRepresentationOption.hdrImage:hdr_image,CIImageRepresentationOption.hdrGainMapAsRGB:!monochrome_export])
     
@@ -418,7 +445,7 @@ if base_image_bool && !gain_map_type1 && !gain_map_type2 {
 if !gain_map_type1 && !gain_map_type2 {
     var adaptive_export_options: NSDictionary
     if monochrome_export {
-        adaptive_export_options = NSDictionary(dictionary:[kCGImageDestinationLossyCompressionQuality:imagequality ?? 0.85, CIImageRepresentationOption.hdrImage:hdr_image,CIImageRepresentationOption.hdrGainMapAsRGB:false])
+        adaptive_export_options = NSDictionary(dictionary:[kCGImageDestinationLossyCompressionQuality:imagequality ?? 0.85, CIImageRepresentationOption.hdrImage:hdr_image,CIImageRepresentationOption.hdrGainMapAsRGB:true])
     } else {
         adaptive_export_options = NSDictionary(dictionary:[kCGImageDestinationLossyCompressionQuality:imagequality ?? 0.85, CIImageRepresentationOption.hdrImage:hdr_image,CIImageRepresentationOption.hdrGainMapAsRGB:true])
     }
